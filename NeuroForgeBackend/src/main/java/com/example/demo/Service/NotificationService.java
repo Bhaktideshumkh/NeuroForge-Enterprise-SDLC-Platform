@@ -1,138 +1,76 @@
-package com.example.demo;
+package com.example.demo.service;
 
-import com.example.demo.Controller.AuthController;
-import com.example.demo.dto.UserOnboardingResult;
-import com.example.demo.model.SystemLog;
-import com.example.demo.model.User;
-import com.example.demo.repository.SystemLogRepository;
-import com.example.demo.repository.UserRepository;
-import com.example.demo.service.UserService;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.transaction.annotation.Transactional;
+import com.example.demo.model.Notification;
+import com.example.demo.repository.NotificationRepository;
+import org.springframework.stereotype.Service;
+import com.example.demo.security.ProjectScopeResolver;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.http.HttpStatus;
+import java.util.Collections;
 
-import java.time.OffsetDateTime;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
 
-import static org.junit.jupiter.api.Assertions.*;
+@Service
+public class NotificationService {
 
-@SpringBootTest
-@Transactional
-public class UserOnboardingIntegrationTest {
+    private final NotificationRepository repository;
+    private final ProjectScopeResolver projectScopeResolver;
 
-    @Autowired
-    private UserService userService;
-
-    @Autowired
-    private AuthController authController;
-
-    @Autowired
-    private UserRepository userRepository;
-
-    @Autowired
-    private SystemLogRepository systemLogRepository;
-
-    @Autowired
-    private PasswordEncoder passwordEncoder;
-
-    @BeforeEach
-    void setUp() {
-        systemLogRepository.deleteAll();
-        userRepository.deleteAll();
+    public NotificationService(NotificationRepository repository, ProjectScopeResolver projectScopeResolver) {
+        this.repository = repository;
+    
+        this.projectScopeResolver = projectScopeResolver;
+    
     }
 
-    @Test
-    void testCompleteEnterpriseUserOnboardingFlow() {
-        // 1. Admin creates / invites new user without supplying a password
-        User newUser = new User();
-        newUser.setFullName("Jane Developer");
-        newUser.setEmail("jane.dev@neuroforge.com");
-        newUser.setPhone("+1-555-0199");
-        newUser.setRole("ROLE_DEVELOPER");
-        newUser.setStatus("INVITED");
+    public Notification create(Notification notification) {
+        return repository.save(notification);
+    }
 
-        UserOnboardingResult onboardingResult = userService.createUser(newUser);
-        assertNotNull(onboardingResult);
-        User createdUser = onboardingResult.getUser();
-        assertNotNull(createdUser.getUserId());
-        assertEquals("jane.dev@neuroforge.com", createdUser.getEmail());
-        assertEquals("ROLE_DEVELOPER", createdUser.getRole());
-        assertEquals("INVITED", createdUser.getStatus());
-        String initialToken = createdUser.getResetToken();
-        assertNotNull(initialToken, "Invitation token must be generated");
-        assertNotNull(createdUser.getResetTokenExpiry());
-        assertTrue(createdUser.getResetTokenExpiry().isAfter(OffsetDateTime.now()));
+    public List<Notification> getAll() {
+        Optional<List<Long>> allowedPids = projectScopeResolver.getResolvedProjectIds();
+        if (allowedPids.isEmpty()) {
+            return repository.findAll();
+        }
+        List<Long> pids = allowedPids.get();
+        if (pids.isEmpty() || pids.contains(-999L)) {
+            return Collections.emptyList();
+        }
+        return repository.findByProjectIdIn(pids);
+    }
 
-        // Verify SystemLog created with deployment_id = NULL
-        List<SystemLog> logs = systemLogRepository.findAll();
-        assertFalse(logs.isEmpty(), "SystemLog must be saved for user onboarding");
-        SystemLog inviteLog = logs.stream()
-                .filter(l -> l.getMessage().contains("User invitation created"))
-                .findFirst()
-                .orElseThrow(() -> new AssertionError("Expected audit log for user invitation"));
-        assertNull(inviteLog.getDeploymentId(), "SystemLog deployment_id must be NULL for user creation");
+    public Optional<Notification> getById(Long id) {
+        Notification entity = repository.findById(id).orElse(null);
+        if (entity == null) return Optional.empty();
+        
+        Long projectId = entity.getProjectId();
+        if (!projectScopeResolver.isProjectAllowed(projectId)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied to this resource");
+        }
+        return Optional.of(entity);
+    }
 
-        // 2. Resend Invitation Flow
-        UserOnboardingResult resendResult = userService.resendInvitation(createdUser.getUserId());
-        assertNotNull(resendResult);
-        User resentUser = resendResult.getUser();
-        assertNotNull(resentUser.getResetToken());
-        assertNotEquals(initialToken, resentUser.getResetToken(), "Resending invitation must issue a fresh token");
+    public Notification update(Long id, Notification updated) {
 
-        // 3. Verify Duplicate Email Registration Handling
-        User duplicateUser = new User();
-        duplicateUser.setFullName("Jane Copycat");
-        duplicateUser.setEmail("jane.dev@neuroforge.com");
-        duplicateUser.setRole("ROLE_USER");
+        Notification existing = repository.findById(id)
+                .orElseThrow(() ->
+                        new RuntimeException(
+                                "Notification not found: " + id));
 
-        ResponseStatusException conflictEx = assertThrows(
-                ResponseStatusException.class,
-                () -> userService.createUser(duplicateUser),
-                "Duplicate email creation must throw ResponseStatusException CONFLICT"
-        );
-        assertEquals(HttpStatus.CONFLICT, conflictEx.getStatusCode());
+        existing.setUserId(updated.getUserId());
+        existing.setProjectId(updated.getProjectId());
+        existing.setTeamId(updated.getTeamId());
 
-        // 4. User receives token and completes Password Setup via AuthController
-        String invitationToken = resentUser.getResetToken();
+        return repository.save(existing);
+    }
 
-        Map<String, String> resetReq = new HashMap<>();
-        resetReq.put("token", invitationToken);
-        resetReq.put("newPassword", "EnterpriseSecurePass123!");
+    public void delete(Long id) {
+        if (!repository.existsById(id)) {
+            throw new RuntimeException(
+                    "Notification not found: " + id);
+        }
 
-        ResponseEntity<?> resetResp = authController.resetPassword(resetReq);
-        assertEquals(HttpStatus.OK, resetResp.getStatusCode());
-
-        // 5. Verify Account Activation & Token Invalidation in DB
-        User activatedUser = userRepository.findByEmail("jane.dev@neuroforge.com").orElseThrow();
-        assertEquals("ACTIVE", activatedUser.getStatus(), "Account status must transition to ACTIVE");
-        assertNull(activatedUser.getResetToken(), "Invitation token must be invalidated");
-        assertNull(activatedUser.getResetTokenExpiry());
-        assertTrue(passwordEncoder.matches("EnterpriseSecurePass123!", activatedUser.getPasswordHash()), "Password must be securely hashed with BCrypt");
-
-        // 6. Verify Newly Onboarded User Can Log In
-        Map<String, String> loginReq = new HashMap<>();
-        loginReq.put("email", "jane.dev@neuroforge.com");
-        loginReq.put("password", "EnterpriseSecurePass123!");
-
-        ResponseEntity<?> loginResp = authController.login(loginReq);
-        assertEquals(HttpStatus.OK, loginResp.getStatusCode());
-        Map<?, ?> loginBody = (Map<?, ?>) loginResp.getBody();
-        assertNotNull(loginBody);
-        assertTrue(loginBody.containsKey("token"));
-        assertEquals("jane.dev@neuroforge.com", loginBody.get("email"));
-        assertEquals("ROLE_DEVELOPER", loginBody.get("role"));
-        assertEquals("ACTIVE", loginBody.get("status"));
-
-        // 7. Verify Used Token Cannot Be Reused
-        ResponseEntity<?> reuseResp = authController.resetPassword(resetReq);
-        assertEquals(HttpStatus.BAD_REQUEST, reuseResp.getStatusCode());
+        repository.deleteById(id);
     }
 }
